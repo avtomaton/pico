@@ -747,7 +747,7 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 
 static Detection stage_objects[2 * MAX_N];
 
-bool learn_with_default_parameters(const char* trdata, const char* dst)
+bool learn_with_default_parameters(const char* trdata, const char* dst, float tfpr)
 {
 	if (!load_training_data(trdata))
 	{
@@ -784,7 +784,7 @@ bool learn_with_default_parameters(const char* trdata, const char* dst)
 	save_cascade_to_file(dst);
 	printf("\n");
 
-	while (sample_training_data(stage_objects, &np, &nn) > 1e-6f)
+	while (sample_training_data(stage_objects, &np, &nn) > tfpr)
 	{
 		learn_new_stage(0.9975f, 0.5f, 64, stage_objects, np, nn);
 		save_cascade_to_file(dst);
@@ -938,7 +938,7 @@ int main(int argc, char* argv[])
 		}
 	}
 	else
-		learn_with_default_parameters(data_file_name.c_str(), cascade_file_name.c_str());
+		learn_with_default_parameters(data_file_name.c_str(), cascade_file_name.c_str(), 1e-6f);
 
 	return 0;
 }
