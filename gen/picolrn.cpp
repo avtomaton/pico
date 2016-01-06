@@ -613,7 +613,7 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 	}
 
 	int t = getticks();
-	int total = 0;
+	int64_t total = 0;
 
 	// TODO: add ALL positives to dataset (or/and export doubtful samples for review)
 	// object samples
@@ -636,7 +636,7 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 		}
 	}
 
-	*np = total;
+	*np = int(total);
 	printf("Got %d positive samples\n", *np);
 
 	// non-object samples
@@ -736,7 +736,7 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 	float etpr = *np / (float)dataset.objects.size();
 	float efpr = (float)(*nn / (double)nw);
 
-	printf("* sampling finished (totally %d samples)\n", total);
+	printf("* sampling finished (totally %lld samples)\n", (long long int)total);
 	printf("	** elapsed time: %.2f s\n", getticks() - t);
 	printf("	** cascade TPR=%.8f (%d/%d)\n", etpr, *np, int(dataset.objects.size()));
 	printf("	** cascade FPR=%.8f (%d/%lld)\n", efpr, *nn, (long long int)nw);
