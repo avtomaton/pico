@@ -66,6 +66,75 @@ struct Dataset
 static Dataset dataset;
 static int cur_stage = 0;
 
+struct Cascade
+{
+	Cascade() :
+		tsr(1.0f),
+		tsc(1.0f),
+		tdepth(5),
+		ntrees(0)
+	{}
+
+	bool load_from_file(const char* path)
+	{
+		FILE* file = fopen(path, "rb");
+		if (!file)
+			return false;
+
+		fread(&tsr, sizeof(float), 1, file);
+		fread(&tsc, sizeof(float), 1, file);
+		fread(&tdepth, sizeof(int), 1, file);
+
+		fread(&ntrees, sizeof(int), 1, file);
+
+		for (int i = 0; i < ntrees; ++i)
+		{
+			fread(&tcodes[i][0], sizeof(int32_t), (1<<tdepth)-1, file);
+			fread(&luts[i][0], sizeof(float), 1<<tdepth, file);
+			fread(&thresholds[i], sizeof(float), 1, file);
+		}
+
+		fclose(file);
+		return true;
+	}
+
+	bool save_to_file(const char* path)
+	{
+		printf("* saving cascade...");
+		fflush(stdout);
+		FILE* file = fopen(path, "wb");
+		if (!file)
+			return false;
+
+		fwrite(&tsr, sizeof(float), 1, file);
+		fwrite(&tsc, sizeof(float), 1, file);
+		fwrite(&tdepth, sizeof(int), 1, file);
+
+		fwrite(&ntrees, sizeof(int), 1, file);
+		for (int i = 0; i < ntrees; ++i)
+		{
+			fwrite(&tcodes[i][0], sizeof(int32_t), (1<<tdepth)-1, file);
+			fwrite(&luts[i][0], sizeof(float), 1<<tdepth, file);
+			fwrite(&thresholds[i], sizeof(float), 1, file);
+		}
+
+		fclose(file);
+		printf("OK\n");
+		fflush(stdout);
+		return true;
+	}
+
+	float tsr;  // row scale ratio
+	float tsc;  // column scale ratio
+	int tdepth;  // max tree depth
+	int ntrees;  // amount of trees
+
+	int32_t tcodes[4096][1024];
+	float luts[4096][1024];
+	float thresholds[4096];
+};
+static Cascade cascade;
+
 // hyperparameters
 #define NRANDS 1024
 
@@ -412,88 +481,29 @@ int grow_rtree(int32_t tcodes[], float lut[], int d,
 	return ret;
 }
 
-float tsr, tsc;
-int tdepth;
-int ntrees=0;
-
-int32_t tcodes[4096][1024];
-float luts[4096][1024];
-
-float thresholds[4096];
-
-int load_cascade_from_file(const char* path)
-{
-	FILE* file = fopen(path, "rb");
-	if (!file)
-		return 0;
-
-	fread(&tsr, sizeof(float), 1, file);
-	fread(&tsc, sizeof(float), 1, file);
-	fread(&tdepth, sizeof(int), 1, file);
-
-	fread(&ntrees, sizeof(int), 1, file);
-
-	for (int i = 0; i < ntrees; ++i)
-	{
-		fread(&tcodes[i][0], sizeof(int32_t), (1<<tdepth)-1, file);
-		fread(&luts[i][0], sizeof(float), 1<<tdepth, file);
-		fread(&thresholds[i], sizeof(float), 1, file);
-	}
-
-	fclose(file);
-	return 1;
-}
-
-bool save_cascade_to_file(const char* path)
-{
-	printf("* saving cascade...");
-	fflush(stdout);
-	FILE* file = fopen(path, "wb");
-	if (!file)
-		return false;
-
-	fwrite(&tsr, sizeof(float), 1, file);
-	fwrite(&tsc, sizeof(float), 1, file);
-	fwrite(&tdepth, sizeof(int), 1, file);
-
-	fwrite(&ntrees, sizeof(int), 1, file);
-	for (int i = 0; i < ntrees; ++i)
-	{
-		fwrite(&tcodes[i][0], sizeof(int32_t), (1<<tdepth)-1, file);
-		fwrite(&luts[i][0], sizeof(float), 1<<tdepth, file);
-		fwrite(&thresholds[i], sizeof(float), 1, file);
-	}
-
-	fclose(file);
-	printf("OK\n");
-	fflush(stdout);
-	return true;
-}
-
 float get_tree_output(int i, int r, int c, int sr, int sc, int iind)
 {
 	int idx = 1;
 
-	for (int j=0; j < tdepth; ++j)
-		idx = 2*idx + bintest(tcodes[i][idx-1], r, c, sr, sc, iind);
+	for (int j = 0; j < cascade.tdepth; ++j)
+		idx = 2*idx + bintest(cascade.tcodes[i][idx-1], r, c, sr, sc, iind);
 
-	return luts[i][idx - (1<<tdepth)];
+	return cascade.luts[i][idx - (1 << cascade.tdepth)];
 }
 
 int classify_region(float* o, int r, int c, int w, int h, int iind)
 {
-	if (!ntrees)
+	if (!cascade.ntrees)
 		return 1;
 
-	int sr = (int)(tsr * h);
-	int sc = (int)(tsc * w);
+	int sr = (int)(cascade.tsr * h);
+	int sc = (int)(cascade.tsc * w);
 
 	*o = 0.0f;
-
-	for (int i = 0; i < ntrees; ++i)
+	for (int i = 0; i < cascade.ntrees; ++i)
 	{
 		*o += get_tree_output(i, r, c, sr, sc, iind);
-		if (*o <= thresholds[i])
+		if (*o <= cascade.thresholds[i])
 			return -1;
 	}
 
@@ -511,15 +521,15 @@ int learn_new_stage(float mintpr, float maxfpr, int maxntrees,
 
 	for (int i = 0; i < np + nn; ++i)
 	{
-		srs[i] = int(tsr * stage_objects[i].h);
-		scs[i] = int(tsc * stage_objects[i].w);
+		srs[i] = int(cascade.tsr * stage_objects[i].h);
+		scs[i] = int(cascade.tsc * stage_objects[i].w);
 	}
 
 	double* ws = (double*)malloc((np+nn)*sizeof(double));
 
-	maxntrees += ntrees;
+	maxntrees += cascade.ntrees;
 	float fpr = 1.0f;
-	while (ntrees < maxntrees && fpr > maxfpr)
+	while (cascade.ntrees < maxntrees && fpr > maxfpr)
 	{
 		float t = getticks();
 
@@ -540,13 +550,16 @@ int learn_new_stage(float mintpr, float maxfpr, int maxntrees,
 			ws[i] /= wsum;
 
 		// grow a tree
-		grow_rtree(tcodes[ntrees], luts[ntrees], tdepth, stage_objects,
+		grow_rtree(
+				cascade.tcodes[cascade.ntrees], cascade.luts[cascade.ntrees],
+				cascade.tdepth, stage_objects,
 				srs, scs, ws, np + nn);
-		thresholds[ntrees++] = -1337.0f;
+		cascade.thresholds[cascade.ntrees++] = -1337.0f;
 
 		// update outputs
 		for (int i = 0; i < np + nn; ++i)
-			stage_objects[i].score += get_tree_output(ntrees - 1,
+			stage_objects[i].score += get_tree_output(
+						cascade.ntrees - 1,
 						stage_objects[i].y,
 						stage_objects[i].x,
 						srs[i], scs[i], stage_objects[i].image_idx);
@@ -580,13 +593,13 @@ int learn_new_stage(float mintpr, float maxfpr, int maxntrees,
 			//dump_floats("os.dump", os, np + nn);
 		}
 
-		thresholds[ntrees - 1] = threshold;
+		cascade.thresholds[cascade.ntrees - 1] = threshold;
 		printf("	** tree %d (%d stage, %.2f s): th=%.2f, tpr=%f, fpr=%f\n",
-			   ntrees, cur_stage, getticks() - t, threshold, tpr, fpr);
+				cascade.ntrees, cur_stage, getticks() - t, threshold, tpr, fpr);
 		fflush(stdout);
 	}
 
-	printf("	** threshold set to %f\n", thresholds[ntrees - 1]);
+	printf("	** threshold set to %f\n", cascade.thresholds[cascade.ntrees - 1]);
 	fflush(stdout);
 
 	free(srs);
@@ -596,7 +609,8 @@ int learn_new_stage(float mintpr, float maxfpr, int maxntrees,
 	return 1;
 }
 
-float sample_training_data(Detection *stage_objects, int* np, int* nn)
+float sample_training_data(
+		Detection *stage_objects, int* np, int* nn)
 {
 	printf("* sampling data...\n");
 	fflush(stdout);
@@ -785,9 +799,9 @@ bool learn_with_default_parameters(const char* trdata, const char* dst, float tf
 		return false;
 	}
 
-	if (load_cascade_from_file(dst))
+	if (cascade.load_from_file(dst))
 		printf("Cascade '%s' loaded, continuing training\n", dst);
-	else if (!save_cascade_to_file(dst))
+	else if (!cascade.save_to_file(dst))
 	{
 		printf("* cannot save cascade to '%s', ABORTING\n", dst);
 		return false;
@@ -796,28 +810,28 @@ bool learn_with_default_parameters(const char* trdata, const char* dst, float tf
 	int np, nn;
 	sample_training_data(stage_objects, &np, &nn);
 	learn_new_stage(0.9800f, 0.5f, 4, stage_objects, np, nn);
-	save_cascade_to_file(dst);
+	cascade.save_to_file(dst);
 	printf("\n");
 
 	sample_training_data(stage_objects, &np, &nn);
 	learn_new_stage(0.9850f, 0.5f, 8, stage_objects, np, nn);
-	save_cascade_to_file(dst);
+	cascade.save_to_file(dst);
 	printf("\n");
 
 	sample_training_data(stage_objects, &np, &nn);
 	learn_new_stage(0.9900f, 0.5f, 16, stage_objects, np, nn);
-	save_cascade_to_file(dst);
+	cascade.save_to_file(dst);
 	printf("\n");
 
 	sample_training_data(stage_objects, &np, &nn);
 	learn_new_stage(0.9950f, 0.5f, 32, stage_objects, np, nn);
-	save_cascade_to_file(dst);
+	cascade.save_to_file(dst);
 	printf("\n");
 
 	while (sample_training_data(stage_objects, &np, &nn) > tfpr)
 	{
 		learn_new_stage(0.9975f, 0.5f, 64, stage_objects, np, nn);
-		save_cascade_to_file(dst);
+		cascade.save_to_file(dst);
 		printf("\n");
 	}
 
@@ -843,9 +857,6 @@ int main(int argc, char* argv[])
 	std::string cascade_file_name;
 	bool init_only = false;
 	bool one_stage = false;
-	tsr = 1.0f;  // scale row
-	tsc = 1.0f;  // scale col
-	tdepth = 5;  // tree max depth
 	float tpr = 0;
 	float fpr = 0;
 	int ntrees = 0;
@@ -861,19 +872,19 @@ int main(int argc, char* argv[])
 		{
 			++opt_count;
 			if (opt_count < argc)
-				tsr = float(atof(argv[opt_count + 1]));
+				cascade.tsr = float(atof(argv[opt_count + 1]));
 		}
 		else if (std::string(argv[opt_count]) == "--sc")
 		{
 			++opt_count;
 			if (opt_count < argc)
-				tsc = float(atof(argv[opt_count + 1]));
+				cascade.tsc = float(atof(argv[opt_count + 1]));
 		}
 		else if (std::string(argv[opt_count]) == "--depth")
 		{
 			++opt_count;
 			if (opt_count < argc)
-				tdepth = atoi(argv[opt_count + 1]);
+				cascade.tdepth = atoi(argv[opt_count + 1]);
 		}
 		else if (std::string(argv[opt_count]) == "--tpr")
 		{
@@ -891,7 +902,7 @@ int main(int argc, char* argv[])
 		{
 			++opt_count;
 			if (opt_count < argc)
-				ntrees = atoi(argv[opt_count + 1]);
+				cascade.ntrees = atoi(argv[opt_count + 1]);
 		}
 		else if (std::string(argv[opt_count]) == "--init-only")
 		{
@@ -929,19 +940,20 @@ int main(int argc, char* argv[])
 	if (init_only)
 	{
 		ntrees = 0;
-		if (!save_cascade_to_file(cascade_file_name.c_str()))
+		if (!cascade.save_to_file(cascade_file_name.c_str()))
 			return -1;
 
-		printf("* initializing: (%f, %f, %d)\n", tsr, tsc, tdepth);
+		printf("* initializing: (%f, %f, %d)\n",
+				cascade.tsr, cascade.tsc, cascade.tdepth);
 		return 0;
 	}
 	else if (one_stage)
 	{
-		if (!load_cascade_from_file(cascade_file_name.c_str()))
+		if (!cascade.load_from_file(cascade_file_name.c_str()))
 		{
 			printf("* cannot load a cascade from '%s', creating new one\n",
 				   cascade_file_name.c_str());
-			if (!save_cascade_to_file(cascade_file_name.c_str()))
+			if (!cascade.save_to_file(cascade_file_name.c_str()))
 			{
 				printf("* cannot save cascade to '%s', ABORTING\n",
 						cascade_file_name.c_str());
@@ -960,7 +972,7 @@ int main(int argc, char* argv[])
 		sample_training_data(stage_objects, &np, &nn);
 		learn_new_stage(tpr, fpr, ntrees, stage_objects, np, nn);
 
-		if (!save_cascade_to_file(cascade_file_name.c_str()))
+		if (!cascade.save_to_file(cascade_file_name.c_str()))
 		{
 			printf("* cannot save cascade to '%s', ABORTING\n",
 					cascade_file_name.c_str());
