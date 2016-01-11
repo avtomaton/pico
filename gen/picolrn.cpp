@@ -640,12 +640,11 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 	printf("Got %d positive samples\n", *np);
 
 	// non-object samples
-	int64_t nw = 0;
-	int64_t stop_nw = int64_t(*np) * 10000000;  // 1e-7 fpr
 	*nn = 0;
 
 	// sample hard negatives (i. e. manually given false positives)
 	printf("* sampling hard negatives...\n");
+	int hard_negatives = 0;
 	for (const auto &obj: dataset.negatives)
 	{
 		// whole image
@@ -659,23 +658,28 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 		++stage_objects;
 
 		++total;
-		++*nn;
-		nw += 1;
+		++hard_negatives;
 	}
 	printf("Got %d hard negative samples\n", *nn);
 
-	// TODO: detect negatives instead of random export
+	// TODO: detected negatives from non-object images
+
+	// random export from non-object images
 	printf("* sampling negatives...\n");
 	fflush(stdout);
-	int stop = 0;
+	int random_negatives = 0;
+	int64_t neg_tries = 0;
+	int64_t neg_tries_limit = int64_t(*np) * 100000;  // 1e-5 fpr for each thread
+	bool have_enough_false_det = false;
 	if (!dataset.background.empty())
 	{
 		#pragma omp parallel
 		{
 			int thid = omp_get_thread_num();
+			int neg_tries_thread = 0;  //  thread local nw counter
 
 			// data mine hard negatives
-			while (!stop)
+			while (!have_enough_false_det)
 			{
 				// take random image
 				int iind = dataset.background[
@@ -688,13 +692,14 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 				int obj_x = mwcrand_r(&prngs[thid]) % (dataset.pdims[iind][1] - obj_w);
 				int obj_y = mwcrand_r(&prngs[thid]) % (dataset.pdims[iind][0] - obj_h);
 
+				++neg_tries_thread;
 				float o;
 				if (classify_region(&o, obj_y, obj_x, obj_w, obj_h, iind) == 1)
 				{
 					// we have a false positive ...
 					#pragma omp critical
 					{
-						if (*nn < *np && nw < stop_nw)
+						if (*nn < *np && neg_tries_thread < neg_tries_limit)
 						{
 							stage_objects->x = obj_x;
 							stage_objects->y = obj_y;
@@ -709,38 +714,63 @@ float sample_training_data(Detection *stage_objects, int* np, int* nn)
 							++*nn;
 						}
 						else
-							stop = 1;
+							have_enough_false_det = true;
 					}
 				}
 
 				#pragma omp master
 				{
-					if (nw % 100000 == 0)
+					if (neg_tries_thread % 100000 == 0)
 					{
-						printf("%.2lf %ld\r", o, nw);
+						printf("%.2lf %ld\r", o, neg_tries);
 						fflush(stdout);
 					}
 				}
+			}  // until have enough negatives or reach tries limit
 
-				if (!stop)
-				{
-					#pragma omp atomic
-					++nw;
-				}
-			}
+			#pragma omp atomic
+			neg_tries += neg_tries_thread;
 		}  // omp parallel
+
+		// get random samples if we have not ehough negatives
+		for (int s = *nn; s < *np; ++s)
+		{
+			// take random image
+			int iind = dataset.background[
+					mwcrand_r(&prngs[0]) % dataset.background.size()];
+
+			// sample the size of a random object in the pool
+			int obj_num = mwcrand_r(&prngs[0]) % dataset.objects.size();
+			int obj_w = dataset.objects[obj_num].w;
+			int obj_h = dataset.objects[obj_num].h;
+			int obj_x = mwcrand_r(&prngs[0]) % (dataset.pdims[iind][1] - obj_w);
+			int obj_y = mwcrand_r(&prngs[0]) % (dataset.pdims[iind][0] - obj_h);
+			stage_objects->x = obj_x;
+			stage_objects->y = obj_y;
+			stage_objects->w = obj_w;
+			stage_objects->h = obj_h;
+			stage_objects->image_idx = iind;
+			stage_objects->obj_class = -1;
+			stage_objects->score = 0;
+			++stage_objects;
+			++random_negatives;
+			++total;
+		}
 	}
 	else
-		nw = 1;
+		neg_tries = 1;  // just division by zero prevention
 
 	float etpr = *np / (float)dataset.objects.size();
-	float efpr = (float)(*nn / (double)nw);
+	float efpr = (float)(*nn / (double)neg_tries);
 
 	printf("* sampling finished (totally %lld samples)\n", (long long int)total);
 	printf("	** elapsed time: %.2f s\n", getticks() - t);
 	printf("	** cascade TPR=%.8f (%d/%d)\n", etpr, *np, int(dataset.objects.size()));
-	printf("	** cascade FPR=%.8f (%d/%lld)\n", efpr, *nn, (long long int)nw);
+	printf("	** cascade FPR=%.8f (%d/%lld)\n", efpr, *nn, (long long int)neg_tries);
 	fflush(stdout);
+
+	*nn += hard_negatives;
+	*nn += random_negatives;
 
 	return efpr;
 }
