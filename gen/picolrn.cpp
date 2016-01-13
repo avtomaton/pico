@@ -136,7 +136,11 @@ struct Cascade
 static Cascade cascade;
 
 // hyperparameters
-#define NRANDS 1024
+#define NRANDS 1024  // amount of binary test codes
+
+// thread-safe random number generators
+#define NUMPRNGS 1024
+static uint64_t prngs[NUMPRNGS];
 
 /*
 	auxiliary stuff
@@ -609,22 +613,115 @@ int learn_new_stage(float mintpr, float maxfpr, int maxntrees,
 	return 1;
 }
 
+void collect_false_positives_random(
+		const Dataset &dataset, Detection *stage_objects,
+		int np,
+		int &nn, int64_t &neg_tries, int64_t &total)
+{
+	int64_t neg_tries_limit = int64_t(np) * 100000;  // 1e-5 fpr for each thread
+	bool have_enough_false_det = false;
+	#pragma omp parallel
+	{
+		int thid = omp_get_thread_num();
+		int neg_tries_thread = 0;  //  thread local nw counter
+
+		// data mine hard negatives
+		while (!have_enough_false_det)
+		{
+			// take random image
+			int iind = dataset.background[
+					mwcrand_r(&prngs[thid]) % dataset.background.size()];
+
+			// sample the size of a random object in the pool
+			int obj_num = mwcrand_r(&prngs[thid]) % dataset.objects.size();
+			int obj_w = dataset.objects[obj_num].w;
+			int obj_h = dataset.objects[obj_num].h;
+			int obj_x = mwcrand_r(&prngs[thid]) % (dataset.pdims[iind][1] - obj_w);
+			int obj_y = mwcrand_r(&prngs[thid]) % (dataset.pdims[iind][0] - obj_h);
+
+			++neg_tries_thread;
+			float o;
+			if (classify_region(&o, obj_y, obj_x, obj_w, obj_h, iind) == 1)
+			{
+				// we have a false positive ...
+				#pragma omp critical
+				{
+					if (nn < np && neg_tries_thread < neg_tries_limit)
+					{
+						stage_objects->x = obj_x;
+						stage_objects->y = obj_y;
+						stage_objects->w = obj_w;
+						stage_objects->h = obj_h;
+						stage_objects->image_idx = iind;
+						stage_objects->obj_class = -1;
+						stage_objects->score = 0;
+						++stage_objects;
+
+						++total;
+						++nn;
+					}
+					else
+						have_enough_false_det = true;
+				}
+			}
+
+			#pragma omp master
+			{
+				if (neg_tries_thread % 100000 == 0)
+				{
+					printf("%.2lf %ld\r", o, neg_tries);
+					fflush(stdout);
+				}
+			}
+		}  // until have enough negatives or reach tries limit
+
+		#pragma omp atomic
+		neg_tries += neg_tries_thread;
+	}  // omp parallel
+}
+
+//void collect_false_positives_detect(
+//		const Dataset &dataset, Detection *stage_objects,
+//		int &nn)
+//{
+
+//}
+
+void collect_negatives_random(
+		const Dataset &dataset, Detection *stage_objects,
+		int np, int nn,
+		int &cur_samples, int64_t &total_samples)
+{
+	for (int s = nn; s < np; ++s)
+	{
+		// take random image
+		int iind = dataset.background[
+				mwcrand_r(&prngs[0]) % dataset.background.size()];
+
+		// sample the size of a random object in the pool
+		int obj_num = mwcrand_r(&prngs[0]) % dataset.objects.size();
+		int obj_w = dataset.objects[obj_num].w;
+		int obj_h = dataset.objects[obj_num].h;
+		int obj_x = mwcrand_r(&prngs[0]) % (dataset.pdims[iind][1] - obj_w);
+		int obj_y = mwcrand_r(&prngs[0]) % (dataset.pdims[iind][0] - obj_h);
+		stage_objects->x = obj_x;
+		stage_objects->y = obj_y;
+		stage_objects->w = obj_w;
+		stage_objects->h = obj_h;
+		stage_objects->image_idx = iind;
+		stage_objects->obj_class = -1;
+		stage_objects->score = 0;
+		++stage_objects;
+		++cur_samples;
+		++total_samples;
+	}
+}
+
 float sample_training_data(
-		Detection *stage_objects, int* np, int* nn)
+		const Dataset &dataset, Detection *stage_objects, int* np, int* nn)
 {
 	printf("* sampling data...\n");
 	fflush(stdout);
-
-	#define NUMPRNGS 1024
-	static int prngsinitialized = 0;
-	static uint64_t prngs[NUMPRNGS];
-	if (!prngsinitialized)
-	{
-		// initialize a PRNG for each thread
-		for (int i = 0; i < NUMPRNGS; ++i)
-			prngs[i] = 0xFFFF * mwcrand() + 0xFFFF1234FFFF0001LL * mwcrand();
-		prngsinitialized = 1;
-	}
 
 	int t = getticks();
 	int64_t total = 0;
@@ -683,93 +780,13 @@ float sample_training_data(
 	fflush(stdout);
 	int random_negatives = 0;
 	int64_t neg_tries = 0;
-	int64_t neg_tries_limit = int64_t(*np) * 100000;  // 1e-5 fpr for each thread
-	bool have_enough_false_det = false;
 	if (!dataset.background.empty())
 	{
-		#pragma omp parallel
-		{
-			int thid = omp_get_thread_num();
-			int neg_tries_thread = 0;  //  thread local nw counter
-
-			// data mine hard negatives
-			while (!have_enough_false_det)
-			{
-				// take random image
-				int iind = dataset.background[
-						mwcrand_r(&prngs[thid]) % dataset.background.size()];
-
-				// sample the size of a random object in the pool
-				int obj_num = mwcrand_r(&prngs[thid]) % dataset.objects.size();
-				int obj_w = dataset.objects[obj_num].w;
-				int obj_h = dataset.objects[obj_num].h;
-				int obj_x = mwcrand_r(&prngs[thid]) % (dataset.pdims[iind][1] - obj_w);
-				int obj_y = mwcrand_r(&prngs[thid]) % (dataset.pdims[iind][0] - obj_h);
-
-				++neg_tries_thread;
-				float o;
-				if (classify_region(&o, obj_y, obj_x, obj_w, obj_h, iind) == 1)
-				{
-					// we have a false positive ...
-					#pragma omp critical
-					{
-						if (*nn < *np && neg_tries_thread < neg_tries_limit)
-						{
-							stage_objects->x = obj_x;
-							stage_objects->y = obj_y;
-							stage_objects->w = obj_w;
-							stage_objects->h = obj_h;
-							stage_objects->image_idx = iind;
-							stage_objects->obj_class = -1;
-							stage_objects->score = 0;
-							++stage_objects;
-
-							++total;
-							++*nn;
-						}
-						else
-							have_enough_false_det = true;
-					}
-				}
-
-				#pragma omp master
-				{
-					if (neg_tries_thread % 100000 == 0)
-					{
-						printf("%.2lf %ld\r", o, neg_tries);
-						fflush(stdout);
-					}
-				}
-			}  // until have enough negatives or reach tries limit
-
-			#pragma omp atomic
-			neg_tries += neg_tries_thread;
-		}  // omp parallel
-
+		collect_false_positives_random(
+				dataset, stage_objects, *np, *nn, neg_tries, total);
 		// get random samples if we have not ehough negatives
-		for (int s = *nn; s < *np; ++s)
-		{
-			// take random image
-			int iind = dataset.background[
-					mwcrand_r(&prngs[0]) % dataset.background.size()];
-
-			// sample the size of a random object in the pool
-			int obj_num = mwcrand_r(&prngs[0]) % dataset.objects.size();
-			int obj_w = dataset.objects[obj_num].w;
-			int obj_h = dataset.objects[obj_num].h;
-			int obj_x = mwcrand_r(&prngs[0]) % (dataset.pdims[iind][1] - obj_w);
-			int obj_y = mwcrand_r(&prngs[0]) % (dataset.pdims[iind][0] - obj_h);
-			stage_objects->x = obj_x;
-			stage_objects->y = obj_y;
-			stage_objects->w = obj_w;
-			stage_objects->h = obj_h;
-			stage_objects->image_idx = iind;
-			stage_objects->obj_class = -1;
-			stage_objects->score = 0;
-			++stage_objects;
-			++random_negatives;
-			++total;
-		}
+		collect_negatives_random(
+				dataset, stage_objects, *np, *nn, random_negatives, total);
 	}
 	else
 		neg_tries = 1;  // just division by zero prevention
@@ -808,27 +825,27 @@ bool learn_with_default_parameters(const char* trdata, const char* dst, float tf
 	}
 
 	int np, nn;
-	sample_training_data(stage_objects, &np, &nn);
+	sample_training_data(dataset, stage_objects, &np, &nn);
 	learn_new_stage(0.9800f, 0.5f, 4, stage_objects, np, nn);
 	cascade.save_to_file(dst);
 	printf("\n");
 
-	sample_training_data(stage_objects, &np, &nn);
+	sample_training_data(dataset, stage_objects, &np, &nn);
 	learn_new_stage(0.9850f, 0.5f, 8, stage_objects, np, nn);
 	cascade.save_to_file(dst);
 	printf("\n");
 
-	sample_training_data(stage_objects, &np, &nn);
+	sample_training_data(dataset, stage_objects, &np, &nn);
 	learn_new_stage(0.9900f, 0.5f, 16, stage_objects, np, nn);
 	cascade.save_to_file(dst);
 	printf("\n");
 
-	sample_training_data(stage_objects, &np, &nn);
+	sample_training_data(dataset, stage_objects, &np, &nn);
 	learn_new_stage(0.9950f, 0.5f, 32, stage_objects, np, nn);
 	cascade.save_to_file(dst);
 	printf("\n");
 
-	while (sample_training_data(stage_objects, &np, &nn) > tfpr)
+	while (sample_training_data(dataset, stage_objects, &np, &nn) > tfpr)
 	{
 		learn_new_stage(0.9975f, 0.5f, 64, stage_objects, np, nn);
 		cascade.save_to_file(dst);
@@ -852,6 +869,9 @@ int main(int argc, char* argv[])
 {
 	// initialize the PRNG
 	smwcrand(time(0));
+	// initialize a PRNG for each thread
+	for (int i = 0; i < NUMPRNGS; ++i)
+		prngs[i] = 0xFFFF * mwcrand() + 0xFFFF1234FFFF0001LL * mwcrand();
 
 	std::string data_file_name;
 	std::string cascade_file_name;
@@ -969,7 +989,7 @@ int main(int argc, char* argv[])
 		}
 
 		int np, nn;
-		sample_training_data(stage_objects, &np, &nn);
+		sample_training_data(dataset, stage_objects, &np, &nn);
 		learn_new_stage(tpr, fpr, ntrees, stage_objects, np, nn);
 
 		if (!cascade.save_to_file(cascade_file_name.c_str()))
