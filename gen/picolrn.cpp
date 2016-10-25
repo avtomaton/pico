@@ -271,6 +271,7 @@ int load_training_data(const char* path)
 		return 0;
 
 	int total_images = 0;
+	int positive_images = 0;
 	while (load_image(
 			dataset.ppixels[total_images],
 			&dataset.pdims[total_images][0],
@@ -287,6 +288,7 @@ int load_training_data(const char* path)
 			dataset.negatives.push_back(total_images);
 		else
 		{
+			positive_images += 1;
 			for (int i = 0; i < n; ++i)
 			{
 				Detection obj;
@@ -302,8 +304,13 @@ int load_training_data(const char* path)
 
 		++total_images;
 	}
+	printf("Loaded %d images: %d positives (%d objects), "
+			"%d negatives, %d background images\n",
+			total_images, positive_images, int(dataset.objects.size()),
+			int(dataset.negatives.size()), int(dataset.background.size()));
 
-	return 1;
+	return dataset.objects.size() &&
+			(dataset.negatives.size() || dataset.background.size());
 }
 
 /*
